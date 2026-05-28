@@ -12,6 +12,11 @@ description = "Replace a BAM header, passing alignment blocks through verbatim â
 name = "rsomics-bam-reheader"
 path = "src/main.rs"
 
+
+[lib]
+name = "rsomics_bam_reheader"
+path = "src/lib.rs"
+doctest = false
 [dependencies]
 rsomics-common = { version = "0.6" }
 rsomics-bamio = { version = "0.1.5" }
