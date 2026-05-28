@@ -11,7 +11,12 @@ fn bench_bam_reheader(c: &mut Criterion) {
     c.bench_function("rsomics-bam-reheader golden", |b| {
         b.iter(|| {
             let out = Command::new(black_box(bin))
-                .args([hdr.to_str().unwrap(), bam.to_str().unwrap(), "-o", "/dev/null"])
+                .args([
+                    hdr.to_str().unwrap(),
+                    bam.to_str().unwrap(),
+                    "-o",
+                    "/dev/null",
+                ])
                 .output()
                 .unwrap();
             assert!(out.status.success());
