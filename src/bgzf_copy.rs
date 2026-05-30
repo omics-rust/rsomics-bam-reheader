@@ -44,15 +44,11 @@ pub const BGZF_EOF: [u8; 28] = [
     0x1b, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 ];
 
-/// One raw BGZF frame plus its decoded uncompressed length. The compressed bytes
-/// are kept verbatim for passthrough; `isize` is read from the gzip trailer so a
-/// frame can be skipped over the uncompressed stream without inflating it.
 struct Frame {
     compressed: Vec<u8>,
     isize: usize,
 }
 
-/// Read one BGZF frame from `reader`. Returns `Ok(None)` at clean EOF.
 fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Frame>> {
     let mut header = [0u8; BGZF_HEADER_LEN];
     match read_full(reader, &mut header)? {
@@ -84,8 +80,6 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Frame>> {
     Ok(Some(Frame { compressed, isize }))
 }
 
-/// Inflate one frame's deflate payload (between the 18-byte header and the
-/// 8-byte trailer) into `dst`.
 fn inflate_frame(frame: &Frame, dst: &mut Vec<u8>) -> Result<()> {
     use flate2::read::DeflateDecoder;
     let payload = &frame.compressed[BGZF_HEADER_LEN..frame.compressed.len() - GZIP_TRAILER_LEN];
@@ -102,10 +96,6 @@ fn inflate_frame(frame: &Frame, dst: &mut Vec<u8>) -> Result<()> {
     Ok(())
 }
 
-/// Frame one buffer of uncompressed bytes into a single BGZF block written to
-/// `out`. Used only for the header and the boundary frame's leftover tail — the
-/// alignment records are never routed through here. `buf` must fit one block
-/// (≤ 65535 uncompressed bytes after deflate framing); callers chunk to that.
 fn write_bgzf_block<W: Write>(out: &mut W, buf: &[u8]) -> Result<()> {
     let mut deflated = Vec::new();
     {
@@ -135,7 +125,6 @@ fn write_bgzf_block<W: Write>(out: &mut W, buf: &[u8]) -> Result<()> {
 /// Maximum uncompressed bytes htslib packs into one BGZF block.
 const BGZF_MAX_ISIZE: usize = 0xff00;
 
-/// Frame an arbitrary-length uncompressed buffer into one or more BGZF blocks.
 pub fn write_bgzf<W: Write>(out: &mut W, mut buf: &[u8]) -> Result<()> {
     if buf.is_empty() {
         return write_bgzf_block(out, buf);
@@ -148,14 +137,8 @@ pub fn write_bgzf<W: Write>(out: &mut W, mut buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Copy a BAM's alignment region — every BGZF frame after the header — verbatim
-/// to `out`, dropping the trailing EOF marker. `consumed_header_len` is the
-/// number of uncompressed header bytes already drained from the front of the
-/// stream by the caller (via [`HeaderReader`]); the boundary frame's leftover
-/// tail is recompressed, all later frames are copied byte-for-byte.
-///
-/// The EOF marker is held back (never written here): cat appends its own single
-/// EOF after the last input, and reheader's caller writes the marker explicitly.
+/// Copy the alignment region verbatim to `out`, dropping the trailing EOF marker.
+/// The boundary frame's leftover tail is recompressed; all later frames are raw-copied.
 pub fn copy_records<R: BufRead, W: Write>(
     state: HeaderReader,
     reader: &mut R,
@@ -167,35 +150,20 @@ pub fn copy_records<R: BufRead, W: Write>(
         decoded,
     } = state;
 
-    // Re-emit the boundary frame's uncompressed leftover (the record bytes after
-    // the header within the frame that straddled the header/record boundary),
-    // then raw-copy the rest. Mirrors samtools writing `block_offset..
-    // block_length` via bgzf_write then `bgzf_raw_read`-ing onward. When the
-    // header ended exactly on a frame boundary there is no leftover.
+    // Re-emit the partial boundary frame's tail (mirrors samtools bgzf_write of
+    // block_offset..block_length). Nothing to do when the header ended on a frame boundary.
     if current.is_some() && consumed < decoded.len() {
         write_bgzf(out, &decoded[consumed..])?;
     }
 
-    // Bulk-copy every remaining compressed byte (all alignment frames) without
-    // parsing frame boundaries — the boundary parsing and per-frame allocation
-    // was pure overhead on what is a byte-for-byte passthrough. Hold back a
-    // 28-byte tail so the input's trailing BGZF EOF marker can be dropped (its
-    // bytes are the last 28); samtools holds back `BGZF_EMPTY_BLOCK_SIZE` the
-    // same way (bam_cat.c). A non-EOF tail (no trailing marker) is written out.
     copy_dropping_eof(reader, out)
 }
 
-/// Stream `reader` to `out` while holding the final 28 bytes back. At EOF the
-/// held tail is dropped iff it equals [`BGZF_EOF`], else it is flushed. Writes
-/// straight from the [`BufRead`] buffer — no intermediate read buffer, no
-/// memmove — so each filled block reaches `out` with a single copy. The 28-byte
-/// `carry` bridges the holdback across `fill_buf` refills.
+// Holds back 28 bytes (= BGZF_EOF size); drops the tail iff it is the EOF marker,
+// otherwise flushes it. Direct BufRead → out, no intermediate copy.
 fn copy_dropping_eof<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -> Result<()> {
     const TAIL: usize = BGZF_EOF.len();
 
-    // The carry holds the trailing ≤ TAIL bytes not yet known to be safe to
-    // write (they might be the final EOF marker). It is always flushed before
-    // the bytes that follow it, preserving order.
     let mut carry: Vec<u8> = Vec::with_capacity(TAIL);
     loop {
         let chunk_len = {
@@ -208,8 +176,6 @@ fn copy_dropping_eof<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -> Resul
             if total <= TAIL {
                 carry.extend_from_slice(chunk);
             } else {
-                // Write all but the final TAIL bytes of (carry ++ chunk); keep
-                // the last TAIL in `carry`.
                 let safe = total - TAIL;
                 let from_carry = carry.len().min(safe);
                 if from_carry > 0 {
@@ -234,19 +200,11 @@ fn copy_dropping_eof<R: BufRead, W: Write>(reader: &mut R, out: &mut W) -> Resul
     Ok(())
 }
 
-/// Streams the uncompressed front of a BAM (the header region) out of a BGZF
-/// file while retaining enough frame state to hand off the rest to
-/// [`copy_records`] without inflating it.
-///
-/// The caller drains exactly the BAM header (magic + text + refs) via [`Read`],
-/// then passes `self` to [`copy_records`], which re-emits the partially-consumed
-/// boundary frame's tail and raw-copies the remaining compressed frames.
+/// Tracks frame state while the BAM header is drained, so `copy_records` can
+/// pick up from the partially-consumed boundary frame without re-inflating it.
 pub struct HeaderReader {
-    /// The frame currently being drained, if any uncompressed bytes remain in it.
     current: Option<Frame>,
-    /// Bytes already consumed from `decoded`.
     consumed: usize,
-    /// Uncompressed content of `current`.
     decoded: Vec<u8>,
 }
 
@@ -266,9 +224,6 @@ impl Default for HeaderReader {
     }
 }
 
-/// A [`Read`] adapter that pulls uncompressed bytes from a BGZF file frame by
-/// frame, recording the live frame so the caller can switch to raw block copy
-/// the instant the BAM header is fully read.
 pub struct HeaderStream<'a, R: Read> {
     inner: &'a mut R,
     state: &'a mut HeaderReader,
@@ -308,8 +263,7 @@ impl<R: Read> Read for HeaderStream<'_, R> {
     }
 }
 
-/// Read `buf` fully, tolerating a clean EOF before the first byte. Returns the
-/// number of bytes read (0 = EOF at a frame boundary).
+// Returns 0 on a clean EOF before the first byte.
 fn read_full<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {

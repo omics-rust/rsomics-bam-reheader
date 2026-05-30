@@ -48,8 +48,6 @@ pub struct ReheaderOpts {
     pub no_pg: bool,
 }
 
-/// Parse a SAM-text header file into raw BAM header bytes
-/// (`magic l_text text n_ref refs`) ready to re-frame as BGZF.
 fn build_header_bytes(opts: &ReheaderOpts) -> Result<(Vec<u8>, u64)> {
     let text = std::fs::read(&opts.header_file)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", opts.header_file.display())))?;
@@ -66,8 +64,6 @@ fn build_header_bytes(opts: &ReheaderOpts) -> Result<(Vec<u8>, u64)> {
     }
     let header = parser.finish();
 
-    // Serialise to BAM header bytes via the BAM writer, then inflate the BGZF it
-    // produced back to raw uncompressed bytes (header-sized, negligible cost).
     let mut bgzf = Vec::new();
     {
         let mut hw = bam::io::Writer::new(&mut bgzf);
@@ -149,10 +145,8 @@ pub fn reheader(
 }
 
 fn write_reheadered<W: Write>(input: &Path, out: &mut W, header_bytes: &[u8]) -> Result<()> {
-    // New header first.
     write_bgzf(out, header_bytes)?;
 
-    // Skip the input's own header, then block-copy the alignment records.
     let file = File::open(input)
         .map_err(|e| RsomicsError::InvalidInput(format!("{}: {e}", input.display())))?;
     let mut reader = BufReader::with_capacity(READ_BUFFER, file);
@@ -164,7 +158,6 @@ fn write_reheadered<W: Write>(input: &Path, out: &mut W, header_bytes: &[u8]) ->
     }
     copy_records(state, &mut reader, out)?;
 
-    // Single trailing BGZF EOF marker.
     out.write_all(&bgzf_copy::BGZF_EOF)
         .map_err(RsomicsError::Io)?;
     Ok(())
